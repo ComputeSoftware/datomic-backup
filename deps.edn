@@ -1,0 +1,5 @@
+{:paths   ["src"]
+ :deps    {com.datomic/client-cloud {:mvn/version "0.8.102"}}
+ :aliases {:dev  {:extra-paths ["dev"]
+                  :extra-deps  {com.datomic/dev-local {:local/root "dev-local-0.9.229.jar"}}}
+           :test {:extra-paths ["test"]}}}
