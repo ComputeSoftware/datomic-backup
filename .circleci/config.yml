@@ -1,0 +1,22 @@
+version: 2.1
+
+orbs:
+  clojure: lambdaisland/clojure@0.0.1
+
+jobs:
+  test:
+    docker:
+      - image: computesoftware/zulu-openjdk-11:dev-utils-tools-deps-1.10.1.716-48d721b
+    steps:
+      - checkout
+      - clojure/with_cache:
+          steps:
+            - run:
+                name: Run tests
+                command: clojure -M:dev:test:test-runner
+
+workflows:
+  version: 2
+  ci-workflow:
+    jobs:
+      - test

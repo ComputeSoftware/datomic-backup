@@ -1,5 +1,10 @@
 {:paths   ["src"]
  :deps    {com.datomic/client-cloud {:mvn/version "0.8.102"}}
- :aliases {:dev  {:extra-paths ["dev"]
-                  :extra-deps  {com.datomic/dev-local {:local/root "dev-local-0.9.229.jar"}}}
-           :test {:extra-paths ["test"]}}}
+ :aliases {:dev         {:extra-paths ["dev"]
+                         :extra-deps  {com.datomic/dev-local {:local/root "dev-local-0.9.229.jar"}}}
+           :test        {:extra-paths ["test"]}
+           :test-runner {:extra-deps {org.clojure/test.check        {:mvn/version "1.1.0"}
+                                      lambdaisland/kaocha           {:mvn/version "1.0.700"}
+                                      lambdaisland/kaocha-cloverage {:mvn/version "1.0.63"}
+                                      lambdaisland/kaocha-junit-xml {:mvn/version "0.0.76"}}
+                         :main-opts  ["-m" "kaocha.runner" "--reporter" "kaocha.report/documentation"]}}}
