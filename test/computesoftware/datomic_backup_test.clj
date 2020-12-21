@@ -92,6 +92,22 @@
        :source-conn source-conn
        :dest-conn   dest-conn})))
 
+(defn test-data!
+  [conn]
+  (d/transact conn {:tx-data example-schema})
+  (d/transact conn {:tx-data [{:school/id       1
+                               :school/students [{:student/first "John"
+                                                  :student/last  "Doe"
+                                                  :student/email "johndoe@university.edu"}]
+                               :school/courses  [{:course/id "BIO-101"}
+                                                 {:course/id "BIO-102"}]}
+                              {:semester/year   2018
+                               :semester/season :fall}]})
+  (d/transact conn {:tx-data [{:reg/course   [:course/id "BIO-101"]
+                               :reg/semester [:semester/year+season [2018 :fall]]
+                               :reg/student  [:student/email "johndoe@university.edu"]}]})
+  (d/transact conn {:tx-data [[:db/retract [:course/id "BIO-102"] :course/id]]}))
+
 (deftest get-backup-test
   (with-open [ctx (test-ctx {})]
     (let [backup (db-backup/backup-db
@@ -100,26 +116,32 @@
       (is (= {:tx-count 0} backup)
         "db with no transactions yields empty list"))))
 
-(deftest integration-test
+(deftest backup->conn-integration-test
   (with-open [ctx (test-ctx {})]
     (testing "schema, test data additions only"
-      (d/transact (:source-conn ctx) {:tx-data example-schema})
-      (d/transact (:source-conn ctx) {:tx-data [{:school/id       1
-                                                 :school/students [{:student/first "John"
-                                                                    :student/last  "Doe"
-                                                                    :student/email "johndoe@university.edu"}]
-                                                 :school/courses  [{:course/id "BIO-101"}
-                                                                   {:course/id "BIO-102"}]}
-                                                {:semester/year   2018
-                                                 :semester/season :fall}]})
-      (d/transact (:source-conn ctx) {:tx-data [{:reg/course   [:course/id "BIO-101"]
-                                                 :reg/semester [:semester/year+season [2018 :fall]]
-                                                 :reg/student  [:student/email "johndoe@university.edu"]}]})
-      (d/transact (:source-conn ctx) {:tx-data [[:db/retract [:course/id "BIO-102"] :course/id]]})
+      (test-data! (:source-conn ctx))
       (let [file (tempfile)
             backup (db-backup/backup-db {:source-conn (:source-conn ctx)
                                          :backup-file file})]
         (db-backup/restore-db {:source    file
+                               :dest-conn (:dest-conn ctx)})
+        (is (= {:school/id       1
+                :school/students [{:student/email "johndoe@university.edu"
+                                   :student/first "John"
+                                   :student/last  "Doe"}]}
+              (d/pull (d/db (:dest-conn ctx))
+                [:school/id
+                 {:school/students [:student/first
+                                    :student/last
+                                    :student/email]}]
+                [:school/id 1])))))))
+
+(deftest conn->conn-integration-test
+  (with-open [ctx (test-ctx {})]
+    (testing "restore conn -> conn"
+      (test-data! (:source-conn ctx))
+      (let []
+        (db-backup/restore-db {:source    (:source-conn ctx)
                                :dest-conn (:dest-conn ctx)})
         (is (= {:school/id       1
                 :school/students [{:student/email "johndoe@university.edu"
