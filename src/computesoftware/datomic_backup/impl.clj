@@ -61,7 +61,7 @@
     (comp
       (map (fn [{:keys [data]}] (remove ignore-datom data)))
       (filter seq))
-    (d/tx-range conn (cond-> {}
+    (d/tx-range conn (cond-> {:limit -1}
                        start (assoc :start start)
                        stop (assoc :stop stop)
                        timeout (assoc :timeout timeout)))))
