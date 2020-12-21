@@ -1,12 +1,13 @@
 (ns computesoftware.datomic-backup
   (:require
     [datomic.client.api :as d]
-    [computesoftware.datomic-backup.impl :as impl]
-    [clojure.java.io :as io])
+    [clojure.java.io :as io]
+    [computesoftware.datomic-backup.impl :as impl])
   (:import (java.io Closeable)))
 
 (defn restore-db
-  [{:keys [source dest-conn stop init-state with?]}]
+  [{:keys [source dest-conn stop init-state with? transact]
+    :or   {transact d/transact}}]
   (let [source (if (impl/conn? source) source (io/reader (io/file source)))
         init-state (assoc init-state :tx-count 0)
         transactions (impl/transactions-from-source source
@@ -21,7 +22,7 @@
           (impl/next-datoms-state
             (if with?
               #(d/with (:db-before state) %)
-              #(d/transact dest-conn %))
+              #(transact dest-conn %))
             state datoms))
         (assoc init-state
           :db-before init-db
