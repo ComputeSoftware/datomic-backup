@@ -4,7 +4,8 @@
     [clojure.string :as str]
     [clojure.edn :as edn]
     [datomic.client.api :as d]
-    [datomic.client.api.protocols :as client-protocols]))
+    [datomic.client.api.protocols :as client-protocols])
+  (:import (java.util Date)))
 
 (defrecord Datom [e a v tx added]
   clojure.lang.Indexed
@@ -118,20 +119,112 @@
                 [(Long/parseLong (subs tid (count tid-prefix))) eid])))
        tempids)}))
 
+(defn tx-instant-attr-id
+  [db]
+  (:db/id (d/pull db [:db/id] :db/txInstant)))
+
+(defn filter-map->fn
+  [db {:keys [include-attrs exclude-attrs]}]
+  (let [attrs (set (concat (keys include-attrs) exclude-attrs))
+        attr->id (into {}
+                   (d/q '[:find ?attr ?e
+                          :in $ [?attr ...]
+                          :where
+                          [?e :db/ident ?attr]]
+                     db attrs))
+        txInstant-eid (tx-instant-attr-id db)
+
+        excluded-eids (set (map attr->id exclude-attrs))
+        excluded? (fn [[_ attr-eid]] (contains? excluded-eids attr-eid))
+
+        date-lookup (fn [k]
+                      (into {}
+                        (map (fn [[attr attr-config]]
+                               [(attr->id attr) (get attr-config k)]))
+                        include-attrs))
+        eid->min-date (date-lookup :since)
+        eid->max-date (date-lookup :before)
+        included? (fn [tx-date [_ attr-eid _]]
+                    (let [min-date (get eid->min-date attr-eid (Date. 0))
+                          max-date (get eid->max-date attr-eid (Date. Long/MAX_VALUE))]
+                      (if (and tx-date (or min-date max-date))
+                        (and
+                          (neg? (compare tx-date max-date))
+                          (neg? (compare min-date tx-date)))
+                        true)))]
+    (fn [datoms]
+      (let [tx-date (some (fn [[_ a date]]
+                            (when (= a txInstant-eid) date))
+                      datoms)]
+        (filterv (fn [d]
+                   (and
+                     (not (excluded? d))
+                     (included? tx-date d)))
+          datoms)))))
+
+(defn tx-contains-only-tx-datoms?
+  [txInstance-attr-eid datoms]
+  (let [tx-eid (:e (some (fn [d] (when (= txInstance-attr-eid (:a d)) d)) datoms))]
+    (every? #(= tx-eid (:e %)) datoms)))
+
+(defn filter-datoms-by-currently-existing
+  [db datoms]
+  (filterv
+    (fn [d]
+      (and
+        ;; datom exists in current db
+        (first
+          (d/datoms db {:index      :eavt
+                        :components [(:e d) (:a d) (:v d)]
+                        :limit      1}))
+        ;; if ref, make sure not a pointer to a non-existent datom
+        (if (= :db.type/ref (attr-value-type db (:a d)))
+          (let [ds (d/datoms db {:index      :vaet
+                                 :components [(:v d)]
+                                 :limit      2})]
+            (or
+              ;; if count is 2 or more, datom should be included
+              (= 2 (bounded-count 2 ds))
+              ;; if nil or only datom's value is equal to the current datom, this
+              ;; reference is no longer relevant.
+              (not= (:v (first ds)) (:v d))))
+          true)))
+    datoms))
+
+(defn current-db-transform-fn
+  [db remove-empty-transactions?]
+  (let [txInstant-attr-eid (tx-instant-attr-id db)]
+    (fn [datoms]
+      (let [ds (filter-datoms-by-currently-existing db datoms)]
+        (if (and remove-empty-transactions?
+              (tx-contains-only-tx-datoms? txInstant-attr-eid ds))
+          []
+          ds)))))
+
 (defn transactions-from-file
-  [reader]
-  (map read-edn-string (line-seq reader)))
+  [reader {:keys [transform-datoms]
+           :or   {transform-datoms identity}}]
+  (eduction
+    (comp
+      (map read-edn-string)
+      (map transform-datoms)
+      (filter seq))
+    (line-seq reader)))
 
 (defn transactions-from-conn
-  [source-conn {:keys [start stop]}]
+  [source-conn {:keys [start stop transform-datoms]}]
   (let [db (d/db source-conn)
         stop-t (or stop (:t db))
         ignore-ids (into #{} (map :e) (bootstrap-datoms db))]
-    (get-transaction-stream source-conn
-      (cond-> {:ignore-datom (fn [d] (contains? ignore-ids (:e d)))
-               :stop         stop-t}
-        start
-        (assoc :start start)))))
+    (eduction
+      (comp
+        (map (or transform-datoms identity))
+        (filter seq))
+      (get-transaction-stream source-conn
+        (cond-> {:ignore-datom (fn [d] (contains? ignore-ids (:e d)))
+                 :stop         stop-t}
+          start
+          (assoc :start start))))))
 
 (defn conn? [x] (satisfies? client-protocols/Connection x))
 
@@ -139,10 +232,10 @@
   [source arg-map]
   (if (conn? source)
     (transactions-from-conn source arg-map)
-    (transactions-from-file source)))
+    (transactions-from-file source arg-map)))
 
 (defn next-datoms-state
-  [tx! {:keys [source-eid->dest-eid db-before] :as acc} datoms]
+  [{:keys [source-eid->dest-eid db-before] :as acc} datoms tx!]
   (let [tx (:tx (first datoms))
         tx-data (datom-batch-tx-data db-before datoms source-eid->dest-eid)
         tx-report (try
@@ -164,13 +257,46 @@
 (def separator (System/getProperty "line.separator"))
 
 (defn next-file-state
-  [writer acc datoms]
+  [acc datoms writer]
   (.write writer (pr-str datoms))
   (.write writer separator)
   (let [tx (:tx (first datoms))]
     (-> acc
       (assoc :last-imported-tx tx)
       (update :tx-count inc))))
+
+(let [fmt-num #(format "%,d" %)]
+  (defn next-progress-report
+    [state progress cur-tx-id max-tx-id]
+    (let [total-txes (:total-expected-txes state
+                       (- max-tx-id cur-tx-id))
+          txes-remaining (- max-tx-id cur-tx-id)
+          txes-complete (- total-txes txes-remaining)
+          perc-done (/ txes-complete total-txes)
+          last-perc-done (:last-reported-percent state 0.0)
+          report? (>= (- perc-done last-perc-done)
+                    (:every progress 0.05))]
+      (when report?
+        (println
+          (str
+            (Math/round (double (* 100 perc-done))) "% done "
+            "(complete: " (fmt-num txes-complete) ", remaining: " (fmt-num txes-remaining) ")")))
+      (cond-> (assoc state :total-expected-txes total-txes)
+        report? (assoc :last-reported-percent perc-done)))))
+
+(defn get-next-tx-id
+  [conn]
+  (-> (d/with-db conn)
+    (d/with {})
+    :tx-data
+    first
+    :tx))
+
+(defn max-tx-id-from-source
+  [source]
+  (if (conn? source)
+    (get-next-tx-id source)
+    (last-backed-up-tx-id source)))
 
 (defn write-state-file!
   [state-file {:keys [:source-eid->dest-eid
