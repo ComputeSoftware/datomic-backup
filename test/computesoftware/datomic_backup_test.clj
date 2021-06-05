@@ -57,10 +57,10 @@
     (testh/test-data! (:source-conn ctx))
     (testing "restore conn -> conn"
       (let [file (testh/tempfile)
-            backup (backup/backup-current-db {:source-conn                (:source-conn ctx)
-                                              :remove-empty-transactions? true
-                                              :backup-file                file
-                                              :filter                     {:exclude-attrs [:student/first]}})]
+            backup (backup/backup-db-no-history {:source-conn                (:source-conn ctx)
+                                                 :remove-empty-transactions? true
+                                                 :backup-file                file
+                                                 :filter                     {:exclude-attrs [:student/first]}})]
         (is (= 3
               (count
                 (with-open [rdr (io/reader file)]
@@ -82,3 +82,23 @@
                 {:index      :eavt
                  :components [[:course/id "BIO-102"]]}))
           "no history of entity is included")))))
+
+(deftest copy-db-integration-test
+  (with-open [ctx (testh/test-ctx {})]
+    (testh/test-data! (:source-conn ctx))
+    (testing "restore conn -> conn"
+      (def r
+        (backup/copy-db
+          {:source-db      (d/db (:source-conn ctx))
+           :dest-conn      (:dest-conn ctx)
+           :max-batch-size 1}))
+      (is (= {:school/id       1
+              :school/students [{:student/email "johndoe@university.edu"
+                                 :student/first "John"
+                                 :student/last  "Doe"}]}
+            (d/pull (d/db (:dest-conn ctx))
+              [:school/id
+               {:school/students [:student/first
+                                  :student/last
+                                  :student/email]}]
+              [:school/id 1]))))))

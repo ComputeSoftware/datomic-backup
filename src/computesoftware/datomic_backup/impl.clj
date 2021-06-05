@@ -4,7 +4,8 @@
     [clojure.string :as str]
     [clojure.edn :as edn]
     [datomic.client.api :as d]
-    [datomic.client.api.protocols :as client-protocols])
+    [datomic.client.api.protocols :as client-protocols]
+    [clojure.walk :as walk])
   (:import (java.util Date)))
 
 (defrecord Datom [e a v tx added]
@@ -47,12 +48,16 @@
           (first)
           :tx)))))
 
-(defn bootstrap-datoms
+(defn bootstrap-datoms-stop-tx
   [db]
   (let [ds (d/datoms db
              {:index      :avet
-              :components [:db/txInstant #inst"1970-01-01"]})
-        stop-tx (:tx (apply max-key :tx ds))
+              :components [:db/txInstant #inst"1970-01-01"]})]
+    (:tx (apply max-key :tx ds))))
+
+(defn bootstrap-datoms
+  [db]
+  (let [stop-tx (bootstrap-datoms-stop-tx db)
         bootstraped-db (d/as-of db stop-tx)]
     (d/datoms bootstraped-db {:index :eavt})))
 
@@ -167,31 +172,32 @@
   (let [tx-eid (:e (some (fn [d] (when (= txInstance-attr-eid (:a d)) d)) datoms))]
     (every? #(= tx-eid (:e %)) datoms)))
 
+(defn current-datom?
+  [db datom]
+  (and
+    ;; datom exists in current db
+    (first
+      (d/datoms db {:index      :eavt
+                    :components [(:e datom) (:a datom) (:v datom)]
+                    :limit      1}))
+    ;; if ref, make sure not a pointer to a non-existent datom
+    (if (= :db.type/ref (attr-value-type db (:a datom)))
+      (let [ds (d/datoms db {:index      :vaet
+                             :components [(:v datom)]
+                             :limit      2})]
+        (or
+          ;; if count is 2 or more, datom should be included
+          (= 2 (bounded-count 2 ds))
+          ;; if nil or only datom's value is equal to the current datom, this
+          ;; reference is no longer relevant.
+          (not= (:v (first ds)) (:v datom))))
+      true)))
+
 (defn filter-datoms-by-currently-existing
   [db datoms]
-  (filterv
-    (fn [d]
-      (and
-        ;; datom exists in current db
-        (first
-          (d/datoms db {:index      :eavt
-                        :components [(:e d) (:a d) (:v d)]
-                        :limit      1}))
-        ;; if ref, make sure not a pointer to a non-existent datom
-        (if (= :db.type/ref (attr-value-type db (:a d)))
-          (let [ds (d/datoms db {:index      :vaet
-                                 :components [(:v d)]
-                                 :limit      2})]
-            (or
-              ;; if count is 2 or more, datom should be included
-              (= 2 (bounded-count 2 ds))
-              ;; if nil or only datom's value is equal to the current datom, this
-              ;; reference is no longer relevant.
-              (not= (:v (first ds)) (:v d))))
-          true)))
-    datoms))
+  (filterv (fn [d] (current-datom? db d)) datoms))
 
-(defn current-db-transform-fn
+(defn no-history-transform-fn
   [db remove-empty-transactions?]
   (let [txInstant-attr-eid (tx-instant-attr-id db)]
     (fn [datoms]
@@ -305,3 +311,18 @@
     (cond-> {:version          1
              :last-imported-tx last-imported-tx}
       source-eid->dest-eid (assoc :source-eid->dest-eid source-eid->dest-eid))))
+
+(defn q-schema
+  [db]
+  (into {}
+    (map (fn [[{:keys [db/id db/ident] :as schema}]]
+           (let [schema (into {}
+                          (map (fn [[k v]]
+                                 [k (if-let [ident (:db/ident v)] ident v)]))
+                          schema)]
+             {id schema ident schema})))
+    (d/q {:query '[:find (pull ?a [*])
+                   :where
+                   [?a :db/ident]]
+          :args  [db]
+          :limit -1})))

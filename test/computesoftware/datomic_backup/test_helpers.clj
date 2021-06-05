@@ -74,6 +74,7 @@
   [{}]
   (let [client (d/client
                  {:server-type :dev-local
+                  :storage-dir :mem
                   :system      (str *ns*)})
         cleanupf (fn []
                    (doseq [db (d/list-databases client {})]
