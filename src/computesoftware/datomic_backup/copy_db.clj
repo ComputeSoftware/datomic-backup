@@ -141,11 +141,13 @@
   [{:keys [source-db dest-conn max-batch-size]}]
   (let [datoms (d/datoms source-db {:index :eavt :limit -1})
         source-schema (impl/q-schema source-db)
-        batches (let [bootstrap-ids (into #{} (map :e) (impl/bootstrap-datoms source-db))
-                      schema-ids (into #{} (comp (filter (fn [[x]] (number? x))) (map first)) source-schema)
-                      ignore-ids (sets/union bootstrap-ids schema-ids)]
+        batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
+                      schema-ids (into #{} (comp (filter (fn [[x]] (number? x))) (map first)) source-schema)]
                   (->> datoms
-                    (remove (fn [d] (contains? ignore-ids (:e d))))
+                    (remove (fn [[e _ _ tx]]
+                              (or
+                                (contains? schema-ids e)
+                                (<= tx max-bootstrap-tx))))
                     (partition-all max-batch-size)))]
     ;; schema tx
     (d/transact dest-conn {:tx-data (into []
@@ -180,10 +182,10 @@
   (d/delete-database destc {:db-name "test"})
   (def dest-conn (d/connect destc {:db-name "test"}))
 
-  (copy-datoms
+  (full-copy
     {:source-db      source-db
      :dest-conn      dest-conn
-     :max-batch-size 1})
+     :max-batch-size 100})
 
   (def sm (impl/q-schema source-db))
   (get sm :language/name)
