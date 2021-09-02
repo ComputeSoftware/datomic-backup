@@ -1,7 +1,9 @@
 {:paths   ["src"]
- :deps    {com.datomic/client-cloud {:mvn/version "0.8.105"}}
+ :deps    {com.datomic/client-cloud  {:mvn/version "0.8.105"}
+           org.clojure/tools.logging {:mvn/version "1.1.0"}}
  :aliases {:dev         {:extra-paths ["dev"]
-                         :extra-deps  {com.datomic/dev-local {:local/root "dev-local-0.9.232.jar"}}}
+                         :extra-deps  {com.datomic/dev-local    {:local/root "dev-local-0.9.232.jar"}
+                                       com.stuartsierra/log.dev {:mvn/version "0.2.0"}}}
            :test        {:extra-paths ["test"]}
            :test-runner {:extra-deps {org.clojure/test.check        {:mvn/version "1.1.0"}
                                       lambdaisland/kaocha           {:mvn/version "1.0.861"}

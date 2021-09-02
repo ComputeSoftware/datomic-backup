@@ -4,3 +4,5 @@ local
 .idea
 *.iml
 .cpcache
+log
+dev/local

@@ -88,7 +88,7 @@
     (testh/test-data! (:source-conn ctx))
     (testing "restore conn -> conn"
       (def r
-        (backup/copy-db
+        (backup/current-state-restore
           {:source-db      (d/db (:source-conn ctx))
            :dest-conn      (:dest-conn ctx)
            :max-batch-size 1}))

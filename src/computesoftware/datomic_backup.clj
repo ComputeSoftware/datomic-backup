@@ -5,7 +5,7 @@
     [clojure.java.io :as io]
     [computesoftware.datomic-backup.impl :as impl]
     [clojure.walk :as walk]
-    [computesoftware.datomic-backup.copy-db :as copy-db])
+    [computesoftware.datomic-backup.current-state-restore :as cs-restore])
   (:import (java.io Closeable)))
 
 (defn restore-db
@@ -136,24 +136,32 @@
     {:source-conn conn
      :backup-file "backup.txt"}))
 
-(defn copy-db
-  [{:keys [source-db dest-conn max-batch-size]
+(defn current-state-restore
+  [{:keys [source-db dest-conn max-batch-size debug]
     :or   {max-batch-size 500}}]
-  (copy-db/full-copy {:source-db      source-db
-                      :dest-conn      dest-conn
-                      :max-batch-size max-batch-size}))
+  (cs-restore/full-copy
+    (cond-> {:source-db      source-db
+             :dest-conn      dest-conn
+             :max-batch-size max-batch-size}
+      debug (assoc :debug debug))))
 
 (comment
-  (def c2 (d/client {:server-type :dev-local
+  (def client (d/client {:server-type :dev-local
                      :storage-dir :mem
                      :system      "t"}))
-  (def conn (d/connect c2 {:db-name "cust-db__0535019e-79fe-44a1-a8d9-b19394abd958"}))
-  (do
-    (d/delete-database c {:db-name "dest"})
-    (d/create-database c {:db-name "dest"})
-    (def dest (d/connect c {:db-name "dest"})))
+  (def source-conn (d/connect client {:db-name "source"}))
+  (d/list-databases client {})
 
-  (def copy-result (copy-db {:source-db (d/db conn) :dest-conn dest}))
+  (do
+    (d/delete-database client {:db-name "dest"})
+    (d/create-database client {:db-name "dest"})
+    (def dest (d/connect client {:db-name "dest"})))
+
+  (def copy-result (current-state-restore
+                     {:source-db      (d/db source-conn)
+                      :dest-conn      dest
+                      :max-batch-size 1000
+                      :debug          true}))
   (count (:old-id->new-id copy-result))
   (get (:old-id->new-id copy-result) 87960930222593)
 
@@ -176,49 +184,4 @@
     '[*]
     87960930222593)
 
-
-
   )
-
-(comment
-  (d/delete-database c {:db-name "dest"})
-  (get schema-lookup 4)
-  (impl/q-schema (d/db conn))
-
-  (copy-db {:source-db (d/db conn)
-            :dest-conn dest})
-
-  (d/pull (d/db dest) '[*] [:id 1])
-
-  (d/pull (d/db dest)
-    '[*]
-    [:customer/id #uuid"0535019e-79fe-44a1-a8d9-b19394abd958"])
-
-
-
-
-
-  (d/with (d/with-db dest)
-    {:tx-data [[:db/add "73" :db/ident :number]
-               [:db/add "73" :db/valueType 22]
-               [:db/add "73" :db/cardinality 35]
-               [:db/add "74" :db/ident :id]
-               [:db/add "74" :db/valueType 22]
-               [:db/add "74" :db/cardinality 35]
-               [:db/add "74" :db/unique 38]
-               ;[:db/add "13194139533318" :db/txInstant #inst"2021-04-26T23:23:06.318-00:00"]
-               ;[:db/add "13194139533319" :db/txInstant #inst"2021-04-26T23:23:07.996-00:00"]
-               #_[:db/add "74766790688843" :number 1]
-               #_[:db/add "74766790688843" :id 1]]
-     })
-
-  (def is (into #{} (map :e) (impl/bootstrap-datoms (d/db conn))))
-  (contains? is 73)
-  tx-data
-
-  (require 'sc.api)
-
-
-  (sc.api/defsc 2)
-
-  (d/datoms (d/since (d/db conn) (impl/bootstrap-datoms-stop-tx (d/db conn))) {:index :eavt}))

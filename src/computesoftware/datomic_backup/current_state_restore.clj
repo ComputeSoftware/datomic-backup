@@ -1,9 +1,11 @@
-(ns computesoftware.datomic-backup.copy-db
+(ns computesoftware.datomic-backup.current-state-restore
   (:require
     [computesoftware.datomic-backup.impl :as impl]
     [datomic.client.api :as d]
     [clojure.set :as sets]
-    [clojure.walk :as walk]))
+    [clojure.walk :as walk]
+    [clojure.tools.logging :as log]
+    [computesoftware.datomic-backup.retry :as retry]))
 
 (defn resolve-datom
   [datom schema old-id->new-id]
@@ -99,7 +101,7 @@
       {} batches)))
 
 (defn copy-datoms
-  [{:keys [dest-conn datom-batches source-schema]}]
+  [{:keys [dest-conn datom-batches source-schema debug]}]
   (reduce
     (fn [{:keys [old-id->new-id] :as acc} batch]
       (let [{:keys [old-id->tempid
@@ -109,9 +111,12 @@
             (txify-datoms batch (:pending acc) source-schema old-id->new-id)]
         (assoc
           (if (seq tx-data)
-            (let [{:keys [tempids]} (try
+            (let [{:keys [tempids
+                          tx-data]} (try
                                       #_(transact-with-max-batch-size dest-conn {:tx-data tx-data} max-batch-size)
-                                      (d/transact dest-conn {:tx-data tx-data})
+                                      (retry/with-retry #(d/transact dest-conn {:tx-data tx-data})
+                                        {:backoff (retry/capped-exponential-backoff-with-jitter
+                                                    {:max-retries 20})})
                                       (catch Exception ex
                                         ;(sc.api/spy)
                                         (throw ex)))
@@ -119,26 +124,33 @@
                                         (map (fn [[old-id tempid]]
                                                (when-let [eid (get tempids tempid)]
                                                  [old-id eid])))
-                                        old-id->tempid)]
+                                        old-id->tempid)
+                  next-acc (-> acc
+                             (assoc
+                               :old-id->new-id next-old-id->new-id)
+                             (update :tx-count (fnil inc 0))
+                             (update :tx-datom-count (fnil + 0) (count tx-data))
+                             (update :tx-eids sets/union tx-eids))]
+              (when (and debug (zero? (mod (:tx-count next-acc) 10)))
+                (log/debug "Batch complete"
+                  :tx-datom-count (:tx-datom-count next-acc)
+                  :tx-count (:tx-count next-acc)))
               ;(prn 'batch batch)
               ;(prn 'tx-data tx-data)
               ;(prn 'old-id->tempid old-id->tempid)
               ;(prn 'tempids tempids)
               ;(prn 'next-old-id->new-id next-old-id->new-id)
               ;(prn '---)
-              (-> acc
-                (assoc
-                  :old-id->new-id next-old-id->new-id)
-                (update :tx-count (fnil inc 0))
-                (update :tx-eids sets/union tx-eids)))
+              next-acc)
             acc)
           :pending pending)))
     {:tx-count       0
+     :tx-datom-count 0
      :old-id->new-id {}
      :tx-eids        #{}} datom-batches))
 
 (defn full-copy
-  [{:keys [source-db dest-conn max-batch-size]}]
+  [{:keys [source-db dest-conn max-batch-size debug]}]
   (let [datoms (d/datoms source-db {:index :eavt :limit -1})
         source-schema (impl/q-schema source-db)
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
@@ -150,15 +162,17 @@
                                 (<= tx max-bootstrap-tx))))
                     (partition-all max-batch-size)))]
     ;; schema tx
-    (d/transact dest-conn {:tx-data (into []
-                                      (comp
-                                        (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
-                                        (distinct))
-                                      source-schema)})
+    (retry/with-retry
+      #(d/transact dest-conn {:tx-data (into []
+                                         (comp
+                                           (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
+                                           (distinct))
+                                         source-schema)}))
     ;; regular txes
-    (copy-datoms {:dest-conn     dest-conn
-                  :datom-batches batches
-                  :source-schema source-schema})))
+    (copy-datoms (cond-> {:dest-conn     dest-conn
+                          :datom-batches batches
+                          :source-schema source-schema}
+                   debug (assoc :debug debug)))))
 
 (comment
   (require 'sc.api)
