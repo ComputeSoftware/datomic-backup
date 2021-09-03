@@ -137,18 +137,19 @@
      :backup-file "backup.txt"}))
 
 (defn current-state-restore
-  [{:keys [source-db dest-conn max-batch-size debug]
+  [{:keys [source-db source-db-async dest-conn max-batch-size debug]
     :or   {max-batch-size 500}}]
   (cs-restore/full-copy
-    (cond-> {:source-db      source-db
-             :dest-conn      dest-conn
-             :max-batch-size max-batch-size}
+    (cond-> {:source-db       source-db
+             :source-db-async source-db-async
+             :dest-conn       dest-conn
+             :max-batch-size  max-batch-size}
       debug (assoc :debug debug))))
 
 (comment
   (def client (d/client {:server-type :dev-local
-                     :storage-dir :mem
-                     :system      "t"}))
+                         :storage-dir :mem
+                         :system      "t"}))
   (def source-conn (d/connect client {:db-name "source"}))
   (d/list-databases client {})
 

@@ -2,10 +2,13 @@
   (:require
     [computesoftware.datomic-backup.impl :as impl]
     [datomic.client.api :as d]
+    [datomic.client.api.async :as d.a]
     [clojure.set :as sets]
     [clojure.walk :as walk]
     [clojure.tools.logging :as log]
-    [computesoftware.datomic-backup.retry :as retry]))
+    [computesoftware.datomic-backup.retry :as retry]
+    [clojure.core.async :as async])
+  (:import (clojure.lang ExceptionInfo)))
 
 (defn resolve-datom
   [datom schema old-id->new-id]
@@ -101,7 +104,13 @@
       {} batches)))
 
 (defn copy-datoms
-  [{:keys [dest-conn datom-batches source-schema debug]}]
+  [{:keys [dest-conn datom-batches source-schema debug on-batch-success init-state]
+    :or   {on-batch-success identity
+           init-state       {:input-datom-count 0
+                             :old-id->new-id    {}
+                             :tx-count          0
+                             :tx-datom-count    0
+                             :tx-eids           #{}}}}]
   (reduce
     (fn [{:keys [old-id->new-id] :as acc} batch]
       (let [{:keys [old-id->tempid
@@ -128,6 +137,7 @@
                   next-acc (-> acc
                              (assoc
                                :old-id->new-id next-old-id->new-id)
+                             (update :input-datom-count (fnil + 0) (count batch))
                              (update :tx-count (fnil inc 0))
                              (update :tx-datom-count (fnil + 0) (count tx-data))
                              (update :tx-eids sets/union tx-eids))]
@@ -135,6 +145,7 @@
                 (log/debug "Batch complete"
                   :tx-datom-count (:tx-datom-count next-acc)
                   :tx-count (:tx-count next-acc)))
+              (on-batch-success next-acc)
               ;(prn 'batch batch)
               ;(prn 'tx-data tx-data)
               ;(prn 'old-id->tempid old-id->tempid)
@@ -144,15 +155,100 @@
               next-acc)
             acc)
           :pending pending)))
-    {:tx-count       0
-     :tx-datom-count 0
-     :old-id->new-id {}
-     :tx-eids        #{}} datom-batches))
+    init-state datom-batches))
 
-(defn full-copy
-  [{:keys [source-db dest-conn max-batch-size debug]}]
-  (let [datoms (d/datoms source-db {:index :eavt :limit -1})
-        source-schema (impl/q-schema source-db)
+(defn read-datoms-in-parallel-sync
+  [source-db {:keys [dest-ch parallelism]}]
+  (let [a-eids (d/q
+                 {:query '[:find ?a
+                           :where
+                           [:db.part/db :db.install/attribute ?a]]
+                  :limit -1
+                  :args  [source-db]})
+        in-ch (async/chan)]
+    (async/onto-chan!! in-ch a-eids)
+    (async/pipeline-blocking parallelism dest-ch
+      (comp
+        (map first)
+        (mapcat (fn [a-eid]
+                  (try
+                    (d/datoms source-db
+                      {:index      :aevt
+                       :components [a-eid]
+                       :limit      -1})
+                    (catch ExceptionInfo ex (ex-data ex))))))
+      in-ch)
+    dest-ch))
+
+(defn anom!
+  [x]
+  (if (:cognitect.anomalies/category x)
+    (throw (ex-info (:cognitect.anomalies/message x) x))
+    x))
+
+(defn <anom!!
+  [ch]
+  (-> ch async/<!! anom!))
+
+(defn unchunk
+  [ch]
+  (async/transduce (halt-when :cognitect.anomalies/category) into [] ch))
+
+(defn read-datoms-in-parallel-async
+  [a-source-db {:keys [dest-ch parallelism]}]
+  (let [a-eids (-> (d.a/q
+                     {:query '[:find ?a
+                               :where
+                               [:db.part/db :db.install/attribute ?a]]
+                      :limit -1
+                      :args  [a-source-db]})
+                 (unchunk)
+                 (<anom!!))
+        in-ch (async/chan)]
+    (async/onto-chan!! in-ch a-eids)
+    (async/pipeline-async parallelism dest-ch
+      (fn [[a-eid] result-ch]
+        (let [ds-ch (d.a/datoms a-source-db
+                      {:index      :aevt
+                       :components [a-eid]
+                       :chunk      1000
+                       :limit      -1})]
+          (async/go-loop []
+            (if-some [ds (async/<! ds-ch)]
+              (if (:cognitect.anomalies/category ds)
+                (do (async/>! result-ch ds) (async/close! result-ch))
+                (do
+                  (doseq [d ds] (async/>! result-ch d))
+                  (recur)))
+              (async/close! result-ch)))))
+      in-ch)
+    dest-ch))
+
+(defn ch->seq
+  [ch]
+  (if-let [v (<anom!! ch)]
+    (lazy-seq (cons v (ch->seq ch)))
+    nil))
+
+(defn -full-copy
+  [{:keys [source-db
+           source-db-async
+           source-schema
+           dest-conn
+           max-batch-size
+           debug
+           datoms-offest
+           init-state]
+    :as   argm}]
+  (let [#_#_datoms (d/datoms source-db (cond-> {:index :eavt :limit -1}
+                                         datoms-offest
+                                         (assoc :offset datoms-offest)))
+        datoms (let [ch (async/chan 20000)]
+                 (-> source-db-async
+                   (read-datoms-in-parallel-async
+                     {:parallelism 30
+                      :dest-ch     ch})
+                   (ch->seq)))
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
                       schema-ids (into #{} (comp (filter (fn [[x]] (number? x))) (map first)) source-schema)]
                   (->> datoms
@@ -160,19 +256,67 @@
                               (or
                                 (contains? schema-ids e)
                                 (<= tx max-bootstrap-tx))))
-                    (partition-all max-batch-size)))]
-    ;; schema tx
+                    (partition-all max-batch-size)))
+        *state (atom nil)]
+    (copy-datoms
+      (cond-> {:dest-conn        dest-conn
+               :datom-batches    batches
+               :source-schema    source-schema
+               :on-batch-success #(reset! *state %)}
+        debug (assoc :debug debug)
+        init-state (assoc :init-state init-state)))
+    #_(try
+        (copy-datoms
+          (cond-> {:dest-conn        dest-conn
+                   :datom-batches    batches
+                   :source-schema    source-schema
+                   :on-batch-success #(reset! *state %)}
+            debug (assoc :debug debug)
+            init-state (assoc :init-state init-state)))
+        (catch ExceptionInfo ex
+          ;; d/datoms can throw exceptions while deep inside a traverse. When those
+          ;; occur, we must recover.
+          (if (retry/default-retriable? ex)
+            (let [offset (:input-datom-count @*state)]
+              (log/info "Received retryable anomaly. Retrying..."
+                :anomaly (ex-data ex)
+                :offset offset)
+              (-full-copy (assoc argm
+                            :datoms-offest offset
+                            :init-state @*state)))
+            (throw ex))))))
+
+(defn copy-schema!
+  [{:keys [source-db dest-conn]}]
+  (let [source-schema (impl/q-schema source-db)]
     (retry/with-retry
-      #(d/transact dest-conn {:tx-data (into []
-                                         (comp
-                                           (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
-                                           (distinct))
-                                         source-schema)}))
-    ;; regular txes
-    (copy-datoms (cond-> {:dest-conn     dest-conn
-                          :datom-batches batches
-                          :source-schema source-schema}
-                   debug (assoc :debug debug)))))
+      #(d/transact dest-conn
+         {:tx-data (into []
+                     (comp
+                       (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
+                       (distinct))
+                     source-schema)}))
+    {:source-schema source-schema}))
+
+(defn full-copy
+  [argm]
+  (let [schema-result (copy-schema! argm)
+        copy-argm (merge argm schema-result)]
+    (-full-copy copy-argm)))
+
+(comment
+  (def testc (d/client {:server-type :dev-local
+                        :storage-dir :mem
+                        :system      "test"}))
+  (d/create-database testc {:db-name "a"})
+  (def aconn (d/connect testc {:db-name "a"}))
+  (d/transact aconn {:tx-data [{:db/ident :foo}]})
+  (def tx-report *1)
+  (apply max-key :e (:tx-data tx-report))
+
+  (seq (d/datoms (d/db aconn) {:index      :eavt
+                               :components [45]}))
+  )
 
 (comment
   (require 'sc.api)
