@@ -224,7 +224,9 @@
 
 (defn anom!
   [x]
-  (if (:cognitect.anomalies/category x)
+  ;; check for map? since dev-local will throw when get'ing a field that does
+  ;; not exist. Throws java.lang.IllegalArgumentException: No matching clause: :cognitect.anomalies/category
+  (if (and (map? x) (:cognitect.anomalies/category x))
     (throw (ex-info (:cognitect.anomalies/message x) x))
     x))
 
