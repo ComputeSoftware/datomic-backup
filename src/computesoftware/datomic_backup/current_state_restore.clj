@@ -295,7 +295,6 @@
            dest-conn
            max-batch-size
            debug
-           init-state
            read-parallelism
            read-chunk]}]
   (let [*running? (atom true)
@@ -324,8 +323,7 @@
                  :datom-batches    batches
                  :source-schema    source-schema
                  :on-batch-success #(reset! *state %)}
-          debug (assoc :debug debug)
-          init-state (assoc :init-state init-state)))
+          debug (assoc :debug debug)))
       (finally (reset! *running? false)))))
 
 (defn copy-schema!
