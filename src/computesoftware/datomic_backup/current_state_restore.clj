@@ -8,7 +8,8 @@
     [clojure.tools.logging :as log]
     [computesoftware.datomic-backup.retry :as retry]
     [clojure.core.async :as async])
-  (:import (clojure.lang ExceptionInfo)))
+  (:import (clojure.lang ExceptionInfo)
+           (java.util.concurrent Executors)))
 
 (defn resolve-datom
   [datom schema old-id->new-id]
@@ -180,6 +181,49 @@
       in-ch)
     dest-ch))
 
+(defn read-datoms-with-retry!
+  [db argm dest-ch]
+  (let [datoms (d/datoms db argm)
+        *offset (volatile! (:offset argm 0))]
+    (try
+      (doseq [d datoms]
+        (async/>!! dest-ch d)
+        (vswap! *offset inc))
+      (catch ExceptionInfo ex
+        (if (retry/default-retriable? ex)
+          (do
+            (read-datoms-with-retry! db (assoc argm :offset @*offset) dest-ch)
+            (log/warn "Retryable anomaly while reading datoms. Retrying from offset..."
+              :anomaly (ex-data ex)
+              :offset @*offset))
+          (throw ex))))))
+
+(defn read-datoms-in-parallel-sync2
+  [source-db {:keys [dest-ch parallelism]}]
+  (let [a-eids (d/q
+                 {:query '[:find ?a
+                           :where
+                           [:db.part/db :db.install/attribute ?a]]
+                  :limit -1
+                  :args  [source-db]})
+        exec (Executors/newFixedThreadPool parallelism)
+        done-ch (async/chan)]
+    (doseq [[a] a-eids]
+      (.submit exec ^Runnable
+        (fn []
+          (read-datoms-with-retry! source-db
+            {:index      :aevt
+             :components [a]
+             :limit      -1}
+            dest-ch)
+          (async/>!! done-ch true))))
+    (async/go-loop [n 0]
+      (async/<! done-ch)
+      (if (< (inc n) (count a-eids))
+        (recur (inc n))
+        (do (prn 'complete) (async/close! dest-ch) (async/thread (.shutdown exec)))))
+    dest-ch))
+
 (defn anom!
   [x]
   (if (:cognitect.anomalies/category x)
@@ -230,6 +274,21 @@
     (lazy-seq (cons v (ch->seq ch)))
     nil))
 
+(defn monitored-chan!
+  [ch {:keys [runningf channel-name every-ms]
+       :or   {every-ms 10000}}]
+  (async/thread
+    (while (runningf)
+      (let [buf (.buf ch)
+            cur (.count buf)
+            total (.n buf)]
+        (log/debug (str channel-name " channel, reporting in...")
+          :current-size cur
+          :total-size total
+          :perc (format "%.3f" (double (* 100 (/ cur total)))))
+        (Thread/sleep every-ms))))
+  ch)
+
 (defn -full-copy
   [{:keys [source-db
            source-db-async
@@ -243,9 +302,13 @@
   (let [#_#_datoms (d/datoms source-db (cond-> {:index :eavt :limit -1}
                                          datoms-offest
                                          (assoc :offset datoms-offest)))
-        datoms (let [ch (async/chan 20000)]
-                 (-> source-db-async
-                   (read-datoms-in-parallel-async
+        *running? (atom true)
+        datoms (let [ch (cond-> (async/chan 20000)
+                          debug
+                          (monitored-chan! {:runningf     #(deref *running?)
+                                            :channel-name "datoms"}))]
+                 (-> source-db
+                   (read-datoms-in-parallel-sync2
                      {:parallelism 30
                       :dest-ch     ch})
                    (ch->seq)))
@@ -258,13 +321,15 @@
                                 (<= tx max-bootstrap-tx))))
                     (partition-all max-batch-size)))
         *state (atom nil)]
-    (copy-datoms
-      (cond-> {:dest-conn        dest-conn
-               :datom-batches    batches
-               :source-schema    source-schema
-               :on-batch-success #(reset! *state %)}
-        debug (assoc :debug debug)
-        init-state (assoc :init-state init-state)))
+    (try
+      (copy-datoms
+        (cond-> {:dest-conn        dest-conn
+                 :datom-batches    batches
+                 :source-schema    source-schema
+                 :on-batch-success #(reset! *state %)}
+          debug (assoc :debug debug)
+          init-state (assoc :init-state init-state)))
+      (finally (reset! *running? false)))
     #_(try
         (copy-datoms
           (cond-> {:dest-conn        dest-conn
