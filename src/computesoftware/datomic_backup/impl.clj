@@ -323,6 +323,6 @@
              {id schema ident schema})))
     (d/q {:query '[:find (pull ?a [*])
                    :where
-                   [?a :db/ident]]
+                   [:db.part/db :db.install/attribute ?a]]
           :args  [db]
           :limit -1})))
