@@ -307,7 +307,7 @@
                    (read-datoms-in-parallel-sync2
                      {:parallelism read-parallelism
                       :dest-ch     ch
-                      :chunk       read-chunk})
+                      :read-chunk  read-chunk})
                    (ch->seq)))
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
                       schema-ids (into #{} (comp (filter (fn [[x]] (number? x))) (map first)) source-schema)]
