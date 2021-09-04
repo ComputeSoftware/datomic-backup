@@ -310,7 +310,7 @@
                                             :channel-name "datoms"}))]
                  (-> source-db
                    (read-datoms-in-parallel-sync2
-                     {:parallelism 30
+                     {:parallelism 20
                       :dest-ch     ch})
                    (ch->seq)))
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
