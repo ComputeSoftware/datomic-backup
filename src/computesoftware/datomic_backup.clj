@@ -137,13 +137,16 @@
      :backup-file "backup.txt"}))
 
 (defn current-state-restore
-  [{:keys [source-db source-db-async dest-conn max-batch-size debug]
-    :or   {max-batch-size 500}}]
+  [{:keys [source-db dest-conn max-batch-size read-parallelism read-chunk debug]
+    :or   {max-batch-size   500
+           read-parallelism 20
+           read-chunk       5000}}]
   (cs-restore/full-copy
-    (cond-> {:source-db       source-db
-             :source-db-async source-db-async
-             :dest-conn       dest-conn
-             :max-batch-size  max-batch-size}
+    (cond-> {:source-db        source-db
+             :dest-conn        dest-conn
+             :max-batch-size   max-batch-size
+             :read-parallelism read-parallelism
+             :read-chunk       read-chunk}
       debug (assoc :debug debug))))
 
 (comment

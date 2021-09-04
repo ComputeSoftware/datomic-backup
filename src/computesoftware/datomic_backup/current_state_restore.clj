@@ -105,13 +105,7 @@
       {} batches)))
 
 (defn copy-datoms
-  [{:keys [dest-conn datom-batches source-schema debug on-batch-success init-state]
-    :or   {on-batch-success identity
-           init-state       {:input-datom-count 0
-                             :old-id->new-id    {}
-                             :tx-count          0
-                             :tx-datom-count    0
-                             :tx-eids           #{}}}}]
+  [{:keys [dest-conn datom-batches source-schema debug]}]
   (reduce
     (fn [{:keys [old-id->new-id] :as acc} batch]
       (let [{:keys [old-id->tempid
@@ -146,7 +140,6 @@
                 (log/debug "Batch complete"
                   :tx-datom-count (:tx-datom-count next-acc)
                   :tx-count (:tx-count next-acc)))
-              (on-batch-success next-acc)
               ;(prn 'batch batch)
               ;(prn 'tx-data tx-data)
               ;(prn 'old-id->tempid old-id->tempid)
@@ -156,7 +149,11 @@
               next-acc)
             acc)
           :pending pending)))
-    init-state datom-batches))
+    {:input-datom-count 0
+     :old-id->new-id    {}
+     :tx-count          0
+     :tx-datom-count    0
+     :tx-eids           #{}} datom-batches))
 
 (defn read-datoms-in-parallel-sync
   [source-db {:keys [dest-ch parallelism]}]
@@ -199,7 +196,7 @@
           (throw ex))))))
 
 (defn read-datoms-in-parallel-sync2
-  [source-db {:keys [dest-ch parallelism]}]
+  [source-db {:keys [dest-ch parallelism read-chunk]}]
   (let [a-eids (d/q
                  {:query '[:find ?a
                            :where
@@ -214,7 +211,7 @@
           (read-datoms-with-retry! source-db
             {:index      :aevt
              :components [a]
-             :chunk      5000
+             :chunk      read-chunk
              :limit      -1}
             dest-ch)
           (async/>!! done-ch true))))
@@ -292,26 +289,23 @@
 
 (defn -full-copy
   [{:keys [source-db
-           source-db-async
            source-schema
            dest-conn
            max-batch-size
            debug
-           datoms-offest
-           init-state]
-    :as   argm}]
-  (let [#_#_datoms (d/datoms source-db (cond-> {:index :eavt :limit -1}
-                                         datoms-offest
-                                         (assoc :offset datoms-offest)))
-        *running? (atom true)
+           init-state
+           read-parallelism
+           read-chunk]}]
+  (let [*running? (atom true)
         datoms (let [ch (cond-> (async/chan 20000)
                           debug
                           (monitored-chan! {:runningf     #(deref *running?)
                                             :channel-name "datoms"}))]
                  (-> source-db
                    (read-datoms-in-parallel-sync2
-                     {:parallelism 20
-                      :dest-ch     ch})
+                     {:parallelism read-parallelism
+                      :dest-ch     ch
+                      :chunk       read-chunk})
                    (ch->seq)))
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
                       schema-ids (into #{} (comp (filter (fn [[x]] (number? x))) (map first)) source-schema)]
@@ -330,27 +324,7 @@
                  :on-batch-success #(reset! *state %)}
           debug (assoc :debug debug)
           init-state (assoc :init-state init-state)))
-      (finally (reset! *running? false)))
-    #_(try
-        (copy-datoms
-          (cond-> {:dest-conn        dest-conn
-                   :datom-batches    batches
-                   :source-schema    source-schema
-                   :on-batch-success #(reset! *state %)}
-            debug (assoc :debug debug)
-            init-state (assoc :init-state init-state)))
-        (catch ExceptionInfo ex
-          ;; d/datoms can throw exceptions while deep inside a traverse. When those
-          ;; occur, we must recover.
-          (if (retry/default-retriable? ex)
-            (let [offset (:input-datom-count @*state)]
-              (log/info "Received retryable anomaly. Retrying..."
-                :anomaly (ex-data ex)
-                :offset offset)
-              (-full-copy (assoc argm
-                            :datoms-offest offset
-                            :init-state @*state)))
-            (throw ex))))))
+      (finally (reset! *running? false)))))
 
 (defn copy-schema!
   [{:keys [source-db dest-conn]}]
