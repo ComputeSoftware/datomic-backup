@@ -214,6 +214,7 @@
           (read-datoms-with-retry! source-db
             {:index      :aevt
              :components [a]
+             :chunk      5000
              :limit      -1}
             dest-ch)
           (async/>!! done-ch true))))
