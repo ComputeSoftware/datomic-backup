@@ -83,15 +83,16 @@
                  :components [[:course/id "BIO-102"]]}))
           "no history of entity is included")))))
 
-(deftest copy-db-integration-test
+(deftest current-state-restore-test
   (with-open [ctx (testh/test-ctx {})]
     (testh/test-data! (:source-conn ctx))
     (testing "restore conn -> conn"
       (def r
         (backup/current-state-restore
-          {:source-db      (d/db (:source-conn ctx))
-           :dest-conn      (:dest-conn ctx)
-           :max-batch-size 1}))
+          {:source-db        (d/db (:source-conn ctx))
+           :dest-conn        (:dest-conn ctx)
+           :read-parallelism 1
+           :max-batch-size   1}))
       (is (= {:school/id       1
               :school/students [{:student/email "johndoe@university.edu"
                                  :student/first "John"
