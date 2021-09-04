@@ -219,7 +219,7 @@
       (async/<! done-ch)
       (if (< (inc n) (count a-eids))
         (recur (inc n))
-        (do (prn 'complete) (async/close! dest-ch) (async/thread (.shutdown exec)))))
+        (do (async/close! dest-ch) (async/thread (.shutdown exec)))))
     dest-ch))
 
 (defn anom!
