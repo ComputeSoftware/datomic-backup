@@ -7,15 +7,16 @@
     [clojure.walk :as walk]
     [clojure.tools.logging :as log]
     [computesoftware.datomic-backup.retry :as retry]
-    [clojure.core.async :as async])
+    [clojure.core.async :as async]
+    [clojure.string :as str])
   (:import (clojure.lang ExceptionInfo)
            (java.util.concurrent Executors)))
 
 (defn resolve-datom
-  [datom schema old-id->new-id]
+  [datom eid->schema old-id->new-id]
   (let [[e a v] datom
-        attr-schema (get schema a)
-        get-value-type #(get-in schema [% :db/valueType])
+        attr-schema (get eid->schema a)
+        get-value-type #(get-in eid->schema [% :db/valueType])
         e-id (or (get old-id->new-id e) (str e))
         resolve-v (fn [value-type v]
                     (if (= value-type :db.type/ref)
@@ -57,7 +58,7 @@
 ;;    2) eid will be transacted in this transaction. only true if
 
 (defn txify-datoms
-  [datoms pending schema old-id->new-id]
+  [datoms pending eid->schema old-id->new-id]
   (let [;; an attempt to add a tuple or ref value pointing to an eid NOT in this
         ;; set should be attempted later
         eids-exposed (into (set (keys old-id->new-id))
@@ -65,18 +66,18 @@
                          (remove (fn [[_ a]]
                                    (contains? #{:db.type/tuple
                                                 :db.type/ref}
-                                     (get-in schema [a :db/valueType]))))
+                                     (get-in eid->schema [a :db/valueType]))))
                          (map :e))
                        datoms)
         datoms-and-pending (concat datoms (map :datom pending))]
     (reduce (fn [acc [e a v :as datom]]
-              (if (= :db/txInstant (get-in schema [a :db/ident]))
+              (if (= :db/txInstant (get-in eid->schema [a :db/ident]))
                 ;; not actually used, only collected for reporting purposes
                 (update acc :tx-eids (fnil conj #{}) e)
                 (let [{:keys [tx
                               required-eids
                               resolved-e-id]
-                       :as   resolved} (resolve-datom datom schema old-id->new-id)
+                       :as   resolved} (resolve-datom datom eid->schema old-id->new-id)
                       can-include? (sets/subset? required-eids eids-exposed)]
                   (cond-> acc
                     can-include?
@@ -105,14 +106,19 @@
       {} batches)))
 
 (defn copy-datoms
-  [{:keys [dest-conn datom-batches source-schema debug]}]
+  [{:keys [dest-conn datom-batches eid->schema init-state debug]
+    :or   {init-state {:input-datom-count 0
+                       :old-id->new-id    {}
+                       :tx-count          0
+                       :tx-datom-count    0
+                       :tx-eids           #{}}}}]
   (reduce
     (fn [{:keys [old-id->new-id] :as acc} batch]
       (let [{:keys [old-id->tempid
                     tx-data
                     tx-eids
                     pending]}
-            (txify-datoms batch (:pending acc) source-schema old-id->new-id)]
+            (txify-datoms batch (:pending acc) eid->schema old-id->new-id)]
         (assoc
           (if (seq tx-data)
             (let [{:keys [tempids
@@ -149,11 +155,10 @@
               next-acc)
             acc)
           :pending pending)))
-    {:input-datom-count 0
-     :old-id->new-id    {}
-     :tx-count          0
-     :tx-datom-count    0
-     :tx-eids           #{}} datom-batches))
+    init-state datom-batches))
+
+(comment (sc.api/defsc 14)
+  )
 
 (defn read-datoms-in-parallel-sync
   [source-db {:keys [dest-ch parallelism]}]
@@ -196,16 +201,10 @@
           (throw ex))))))
 
 (defn read-datoms-in-parallel-sync2
-  [source-db {:keys [dest-ch parallelism read-chunk]}]
-  (let [a-eids (d/q
-                 {:query '[:find ?a
-                           :where
-                           [:db.part/db :db.install/attribute ?a]]
-                  :limit -1
-                  :args  [source-db]})
-        exec (Executors/newFixedThreadPool parallelism)
+  [source-db {:keys [attribute-eids dest-ch parallelism read-chunk]}]
+  (let [exec (Executors/newFixedThreadPool parallelism)
         done-ch (async/chan)]
-    (doseq [[a] a-eids]
+    (doseq [a attribute-eids]
       (.submit exec ^Runnable
         (fn []
           (read-datoms-with-retry! source-db
@@ -217,7 +216,7 @@
           (async/>!! done-ch true))))
     (async/go-loop [n 0]
       (async/<! done-ch)
-      (if (< (inc n) (count a-eids))
+      (if (< (inc n) (count attribute-eids))
         (recur (inc n))
         (do (async/close! dest-ch) (async/thread (.shutdown exec)))))
     dest-ch))
@@ -291,12 +290,14 @@
 
 (defn -full-copy
   [{:keys [source-db
-           source-schema
+           schema-lookup
            dest-conn
            max-batch-size
            debug
            read-parallelism
-           read-chunk]}]
+           read-chunk
+           init-state
+           attribute-eids]}]
   (let [*running? (atom true)
         datoms (let [ch (cond-> (async/chan 20000)
                           debug
@@ -304,45 +305,88 @@
                                             :channel-name "datoms"}))]
                  (-> source-db
                    (read-datoms-in-parallel-sync2
-                     {:parallelism read-parallelism
-                      :dest-ch     ch
-                      :read-chunk  read-chunk})
+                     {:attribute-eids attribute-eids
+                      :parallelism    read-parallelism
+                      :dest-ch        ch
+                      :read-chunk     read-chunk})
                    (ch->seq)))
+        eid->schema (::impl/eid->schema schema-lookup)
+        ident->schema (::impl/ident->schema schema-lookup)
         batches (let [max-bootstrap-tx (impl/bootstrap-datoms-stop-tx source-db)
-                      schema-ids (into #{} (comp (filter (fn [[x]] (number? x))) (map first)) source-schema)]
+                      schema-ids (into #{} (map key) eid->schema)]
                   (->> datoms
-                    (remove (fn [[e _ _ tx]]
+                    (remove (fn [[e a _ tx]]
                               (or
                                 (contains? schema-ids e)
+                                (= (get-in ident->schema [:db.install/attribute :db/id]) a)
                                 (<= tx max-bootstrap-tx))))
-                    (partition-all max-batch-size)))
-        *state (atom nil)]
+                    (partition-all max-batch-size)))]
     (try
       (copy-datoms
-        (cond-> {:dest-conn        dest-conn
-                 :datom-batches    batches
-                 :source-schema    source-schema
-                 :on-batch-success #(reset! *state %)}
-          debug (assoc :debug debug)))
+        (cond-> {:dest-conn     dest-conn
+                 :datom-batches batches
+                 :eid->schema   eid->schema}
+          debug (assoc :debug debug)
+          init-state (assoc :init-state init-state)))
+      ;(catch Exception ex (sc.api/spy) (throw ex))
       (finally (reset! *running? false)))))
 
 (defn copy-schema!
-  [{:keys [source-db dest-conn]}]
-  (let [source-schema (impl/q-schema source-db)]
+  [{:keys [dest-conn schema idents-to-copy]}]
+  (let [source-schema (filter (comp (set idents-to-copy) :db/ident) schema)]
     (retry/with-retry
-      #(d/transact dest-conn
-         {:tx-data (into []
-                     (comp
-                       (map (fn [[_ schema]] (walk/postwalk (fn [x] (if (map? x) (dissoc x :db/id) x)) schema)))
-                       (distinct))
-                     source-schema)}))
+      #(d/transact dest-conn {:tx-data source-schema}))
     {:source-schema source-schema}))
 
-(defn full-copy
-  [argm]
-  (let [schema-result (copy-schema! argm)
-        copy-argm (merge argm schema-result)]
+(defn one-restore-pass
+  [{::keys [schema-lookup] :as argm} {::keys [idents]}]
+  (let [copy-schema-argm (assoc argm
+                           :schema (::impl/schema-raw schema-lookup)
+                           :idents-to-copy idents)
+        _ (copy-schema! copy-schema-argm)
+        attribute-eids (map (fn [i]
+                              (get-in schema-lookup [::impl/ident->schema i :db/id]))
+                         idents)
+        copy-argm (assoc argm
+                    :attribute-eids attribute-eids
+                    :schema-lookup schema-lookup)]
     (-full-copy copy-argm)))
+
+(defn get-passes
+  [schema]
+  (let [filter-idents (fn [pred]
+                        (into #{}
+                          (comp
+                            (filter (fn [schema] (pred schema)))
+                            (map :db/ident)
+                            (remove (fn [ident]
+                                      (and (qualified-keyword? ident)
+                                        (or
+                                          (= "db" (namespace ident))
+                                          (str/starts-with? (namespace ident) "db."))))))
+                          schema))
+        batch2-pred #(= :db.type/tuple (:db/valueType %))
+        a-idents-1 (filter-idents #(not (batch2-pred %)))
+        a-idents-2 (filter-idents #(batch2-pred %))]
+    [{::idents a-idents-1}
+     {::idents a-idents-2}]))
+
+(defn restore
+  [{:keys [source-db] :as argm}]
+  (let [source-schema-lookup (impl/q-schema-lookup source-db)
+        passes (get-passes (::impl/schema-raw source-schema-lookup))
+        one-pass-argm (assoc argm
+                        ::schema-lookup source-schema-lookup)]
+    (reduce
+      (fn [full-copy-init-state pass]
+        (one-restore-pass (cond-> one-pass-argm
+                            full-copy-init-state
+                            (assoc :init-state full-copy-init-state))
+          pass))
+      nil passes)
+    true))
+
+(comment (sc.api/defsc 3))
 
 (comment
   (def testc (d/client {:server-type :dev-local
@@ -369,7 +413,6 @@
 
   (def the-e *e)
 
-  (impl/q-schema source-db)
   (def schema *1)
   (:language/name schema)
 
@@ -380,12 +423,11 @@
   (d/delete-database destc {:db-name "test"})
   (def dest-conn (d/connect destc {:db-name "test"}))
 
-  (full-copy
+  (restore
     {:source-db      source-db
      :dest-conn      dest-conn
      :max-batch-size 100})
 
-  (def sm (impl/q-schema source-db))
   (get sm :language/name)
   (def stx (into []
              (comp

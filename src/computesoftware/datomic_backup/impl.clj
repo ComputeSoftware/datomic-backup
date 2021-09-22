@@ -312,15 +312,38 @@
              :last-imported-tx last-imported-tx}
       source-eid->dest-eid (assoc :source-eid->dest-eid source-eid->dest-eid))))
 
-(defn q-schema
+(defn clean-schema
+  [schema f]
+  (walk/postwalk
+    (fn [x]
+      (f
+        (if (and (map? x)
+              (let [x' (dissoc x :db/id)]
+                (and
+                  (= 1 (count x'))
+                  (= :db/ident (key (first x'))))))
+          (:db/ident x)
+          x)))
+    schema))
+
+(defn schema-result->lookup
+  [schema-result]
+  (reduce
+    (fn [lookup [{:keys [db/id db/ident] :as schema}]]
+      (let [cleaned-schema (clean-schema schema identity)]
+        (-> lookup
+          (update ::schema-raw (fnil conj [])
+            (clean-schema schema (fn [x]
+                                   (if (map? x)
+                                     (dissoc x :db/id)
+                                     x))))
+          (assoc-in [::eid->schema id] cleaned-schema)
+          (assoc-in [::ident->schema ident] cleaned-schema))))
+    {} schema-result))
+
+(defn q-schema-lookup
   [db]
-  (into {}
-    (map (fn [[{:keys [db/id db/ident] :as schema}]]
-           (let [schema (into {}
-                          (map (fn [[k v]]
-                                 [k (if-let [ident (:db/ident v)] ident v)]))
-                          schema)]
-             {id schema ident schema})))
+  (schema-result->lookup
     (d/q {:query '[:find (pull ?a [*])
                    :where
                    [:db.part/db :db.install/attribute ?a]]

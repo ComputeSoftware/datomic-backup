@@ -141,7 +141,7 @@
     :or   {max-batch-size   500
            read-parallelism 20
            read-chunk       5000}}]
-  (cs-restore/full-copy
+  (cs-restore/restore
     (cond-> {:source-db        source-db
              :dest-conn        dest-conn
              :max-batch-size   max-batch-size
