@@ -185,19 +185,28 @@
 
 (defn read-datoms-with-retry!
   [db argm dest-ch]
-  (let [datoms (d/datoms db argm)
-        *offset (volatile! (:offset argm 0))]
+  (let [;; use start-exclusive b/c we can only set *start after we have SUCCESSFULLY
+        ;; received a datom. If we have successfully received the datom, we don't
+        ;; want to start there again. Instead, we want to start at the next value.
+        start-exclusive (::start-exclusive argm)
+        index-range-argm (cond-> argm
+                           start-exclusive
+                           (assoc :start start-exclusive))
+        datoms (cond->> (d/index-range db index-range-argm)
+                 start-exclusive
+                 (drop 1))
+        *start (volatile! nil)]
     (try
       (doseq [d datoms]
         (async/>!! dest-ch d)
-        (vswap! *offset inc))
+        (vreset! *start (:v d)))
       (catch ExceptionInfo ex
         (if (retry/default-retriable? ex)
           (do
-            (read-datoms-with-retry! db (assoc argm :offset @*offset) dest-ch)
-            (log/warn "Retryable anomaly while reading datoms. Retrying from offset..."
+            (read-datoms-with-retry! db (assoc argm ::start-exclusive @*start) dest-ch)
+            (log/warn "Retryable anomaly while reading datoms. Retrying with :start set..."
               :anomaly (ex-data ex)
-              :offset @*offset))
+              :start-exclusive @*start))
           (throw ex))))))
 
 (defn read-datoms-in-parallel-sync2
@@ -207,15 +216,18 @@
     (doseq [a attribute-eids]
       (.submit exec ^Runnable
         (fn []
-          (read-datoms-with-retry! source-db
-            {:index      :aevt
-             :components [a]
-             :chunk      read-chunk
-             :limit      -1}
-            dest-ch)
-          (async/>!! done-ch true))))
+          (log/debug "Start reading datoms..." :attrid a)
+          (try
+            (read-datoms-with-retry! source-db
+              {:attrid a
+               :chunk  read-chunk
+               :limit  -1}
+              dest-ch)
+            (catch Exception ex (async/>!! dest-ch ex)))
+          (async/>!! done-ch a))))
     (async/go-loop [n 0]
-      (async/<! done-ch)
+      (let [attr (async/<! done-ch)]
+        (log/debug "Done reading attr." :attrid attr))
       (if (< (inc n) (count attribute-eids))
         (recur (inc n))
         (do (async/close! dest-ch) (async/thread (.shutdown exec)))))
@@ -225,9 +237,12 @@
   [x]
   ;; check for map? since dev-local will throw when get'ing a field that does
   ;; not exist. Throws java.lang.IllegalArgumentException: No matching clause: :cognitect.anomalies/category
-  (if (and (map? x) (:cognitect.anomalies/category x))
+  (cond
+    (and (map? x) (:cognitect.anomalies/category x))
     (throw (ex-info (:cognitect.anomalies/message x) x))
-    x))
+    (instance? Throwable x)
+    (throw x)
+    :else x))
 
 (defn <anom!!
   [ch]
